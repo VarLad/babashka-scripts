@@ -1,0 +1,613 @@
+#!/usr/bin/env bb
+;; babls - a NuShell-inspired `ls` with color in Babashka.
+;;
+;; Usage:
+;;   babls [path] [-a] [-m] [-r] [-g] [-l] [-t]
+;;
+;; Flags:
+;;   -a / --all              include dotfiles
+;;   -m / --sort-modified    sort by modified time, newest first
+;;   -r / --reverse          reverse sort order
+;;   -g / --git              show git status (+added/-deleted) if inside a repo
+;;   -l / --long             show extra columns: owner/group/other perms + symlink target
+;;   -t / --tree             print a tree view instead of a table (recursive)
+;; Short flags can be combined, e.g. -alr
+;;
+;; The "user", "group", "other" permission columns and the "link" column
+;; (symlink target) only appear when -l/--long is passed. -t/--tree switches
+;; to a recursive tree layout and ignores the table-only flags.
+
+(ns babls
+  (:require [clojure.string :as str]
+            [babashka.process :refer [shell]]
+            [babashka.fs :as fs])
+  (:import [java.io File]
+           [java.nio.file Files LinkOption]
+           [java.nio.file.attribute PosixFilePermissions]))
+
+;; ---------------------------------------------------------------------
+;; Palette
+;; ---------------------------------------------------------------------
+
+(def RESET "\u001b[0m")
+(def BORDER "\u001b[38;5;99m")
+(def HEADER "\u001b[38;5;82m")
+(def INDEX "\u001b[38;5;51m")
+(def TYPE "\u001b[38;5;78m")
+(def SIZE "\u001b[38;5;45m")
+(def MODIFIED "\u001b[38;5;114m")
+(def MODIFIED_RECENT "\u001b[38;5;82m")
+(def MODIFIED_SOON "\u001b[38;5;148m")
+(def MODIFIED_HOURS "\u001b[38;5;184m")
+(def MODIFIED_DAYS "\u001b[38;5;208m")
+(def MODIFIED_WEEKS "\u001b[38;5;203m")
+(def MODIFIED_OLD "\u001b[38;5;244m")
+(def MODIFIED_FUTURE "\u001b[38;5;111m")
+(def DIR "\u001b[38;5;45m")
+(def FILE "\u001b[38;5;252m")
+(def EXEC "\u001b[38;5;197m")
+(def DOTFILE "\u001b[38;5;179m")
+(def WARN "\u001b[38;5;214m")
+(def GIT_DIRTY "\u001b[38;5;214m")
+(def GIT_ADDED "\u001b[38;5;77m")
+(def GIT_REMOVED "\u001b[38;5;203m")
+(def GIT_CLEAN "\u001b[38;5;240m")
+(def PERMS "\u001b[38;5;180m")
+(def PERMS_NONE "\u001b[38;5;240m")
+(def SYMLINK "\u001b[38;5;213m")
+(def SYMLINK_ARROW "\u001b[38;5;98m")
+(def TREE_LINES "\u001b[38;5;99m")
+(def PERM_R "\u001b[38;5;114m")
+(def PERM_W "\u001b[38;5;214m")
+(def PERM_X "\u001b[38;5;203m")
+(def PERM_DASH "\u001b[38;5;240m")
+
+(defn paint [text color]
+  (str color text RESET))
+
+;; ---------------------------------------------------------------------
+;; Terminal size
+;; ---------------------------------------------------------------------
+
+(defn terminal-width
+  "Best-effort detection of the current terminal width in columns.
+   Tries $COLUMNS first, then `stty size` against the controlling tty,
+   falling back to a sane default when neither is available (e.g. when
+   output is piped or redirected)."
+  []
+  (let [default 100]
+    (or (try
+          (when-let [cols (System/getenv "COLUMNS")]
+            (let [n (Integer/parseInt (str/trim cols))]
+              (when (pos? n) n)))
+          (catch Exception _ nil))
+        (try
+          (let [r (shell {:out :string :err :string :continue true}
+                          "sh" "-c" "stty size < /dev/tty 2>/dev/null")]
+            (when (zero? (:exit r))
+              (let [parts (str/split (str/trim (:out r)) #"\s+")]
+                (when (= 2 (count parts))
+                  (let [n (Integer/parseInt (second parts))]
+                    (when (pos? n) n))))))
+          (catch Exception _ nil))
+        default)))
+
+;; ---------------------------------------------------------------------
+;; CLI parsing
+;; ---------------------------------------------------------------------
+
+(defn apply-short-flag [opts c]
+  (case c
+    \a (assoc opts :include-hidden true)
+    \l (assoc opts :long true)
+    \m (assoc opts :sort-modified true)
+    \r (assoc opts :reverse true)
+    \g (assoc opts :git true)
+    \t (assoc opts :tree true)
+    opts))
+
+(defn parse-args [args]
+  (loop [args args
+         opts {:path nil :include-hidden false :sort-modified false :reverse false
+               :git false :long false :tree false}]
+    (if (empty? args)
+      (update opts :path #(or % "."))
+      (let [a (first args)]
+        (cond
+          (= a "--all") (recur (rest args) (assoc opts :include-hidden true))
+          (= a "--long") (recur (rest args) (assoc opts :long true))
+          (= a "--sort-modified") (recur (rest args) (assoc opts :sort-modified true))
+          (= a "--reverse") (recur (rest args) (assoc opts :reverse true))
+          (= a "--git") (recur (rest args) (assoc opts :git true))
+          (= a "--tree") (recur (rest args) (assoc opts :tree true))
+          (and (str/starts-with? a "-")
+               (not (str/starts-with? a "--"))
+               (> (count a) 1))
+          (recur (rest args) (reduce apply-short-flag opts (rest a)))
+          :else (recur (rest args) (assoc opts :path a)))))))
+
+;; ---------------------------------------------------------------------
+;; Formatting helpers
+;; ---------------------------------------------------------------------
+
+(defn format-size [size]
+  (let [units [["B" 1] ["KB" 1024] ["MB" (* 1024 1024)]
+               ["GB" (* 1024 1024 1024)] ["TB" (* 1024 1024 1024 1024)]]
+        [uname factor] (reduce (fn [acc [_ factor :as u]]
+                                  (if (>= size factor) u acc))
+                                (first units) units)
+        value (/ (double size) factor)
+        text (if (and (< value 10.0) (not= uname "B"))
+               (format "%.1f" value)
+               (format "%.0f" value))]
+    (str text " " uname)))
+
+(defn format-relative-time [millis]
+  (let [now (System/currentTimeMillis)
+        diff (- now millis)
+        past? (>= diff 0)
+        secs (long (/ (Math/abs diff) 1000))
+        recency (cond
+                   (not past?) :future
+                   (< secs 5) :just-now
+                   (< secs 60) :seconds
+                   (< secs 3600) :minutes
+                   (< secs 86400) :hours
+                   (< secs 604800) :days
+                   (< secs 2629746) :weeks
+                   (< secs 31557600) :months
+                   :else :years)
+        text (cond
+               (= recency :just-now) "just now"
+               (not past?)
+               (let [[value unit] (cond
+                                     (< secs 60) [secs "second"]
+                                     (< secs 3600) [(quot secs 60) "minute"]
+                                     (< secs 86400) [(quot secs 3600) "hour"]
+                                     (< secs 604800) [(quot secs 86400) "day"]
+                                     :else [(quot secs 604800) "week"])]
+                 (str "in " value " " unit (when (not= value 1) "s")))
+               :else
+               (let [[value unit] (cond
+                                     (< secs 60) [secs "second"]
+                                     (< secs 3600) [(quot secs 60) "minute"]
+                                     (< secs 86400) [(quot secs 3600) "hour"]
+                                     (< secs 604800) [(quot secs 86400) "day"]
+                                     (< secs 2629746) [(quot secs 604800) "week"]
+                                     (< secs 31557600) [(quot secs 2629746) "month"]
+                                     :else [(quot secs 31557600) "year"])]
+                 (str value " " unit (when (not= value 1) "s") " ago")))]
+    [text recency]))
+
+(defn color-modified [text recency]
+  (let [color (case recency
+                :just-now MODIFIED_RECENT
+                :seconds MODIFIED_RECENT
+                :minutes MODIFIED_SOON
+                :hours MODIFIED
+                :days MODIFIED_HOURS
+                :weeks MODIFIED_DAYS
+                :months MODIFIED_WEEKS
+                :years MODIFIED_OLD
+                :future MODIFIED_FUTURE
+                MODIFIED)]
+    (paint text color)))
+
+(defn color-name [name dir? exec? hidden? symlink?]
+  (cond
+    symlink? (paint name SYMLINK)
+    dir? (paint name DIR)
+    hidden? (paint name DOTFILE)
+    exec? (paint name EXEC)
+    (or (str/ends-with? name ".md") (str/ends-with? name ".toml")) (paint name WARN)
+    :else (paint name FILE)))
+
+;; ---------------------------------------------------------------------
+;; Permissions & symlinks
+;; ---------------------------------------------------------------------
+
+(defn permission-string
+  "POSIX-style rwxrwxrwx string, falling back to a coarse approximation
+   (based on canRead/canWrite/canExecute) on non-POSIX filesystems."
+  [^File f]
+  (try
+    (let [perms (Files/getPosixFilePermissions (.toPath f) (make-array LinkOption 0))]
+      (PosixFilePermissions/toString perms))
+    (catch UnsupportedOperationException _
+      (let [rwx (str (if (.canRead f) "r" "-")
+                      (if (.canWrite f) "w" "-")
+                      (if (.canExecute f) "x" "-"))]
+        (str rwx rwx rwx)))
+    (catch Exception _ "?????????")))
+
+(defn split-perm-triad
+  "Splits a 9-char rwxrwxrwx string into [user group other] 3-char triads."
+  [perm-str]
+  (if (= (count perm-str) 9)
+    [(subs perm-str 0 3) (subs perm-str 3 6) (subs perm-str 6 9)]
+    [perm-str perm-str perm-str]))
+
+(defn color-perm-triad [triad]
+  (apply str
+         (map (fn [ch]
+                (case ch
+                  \r (paint "r" PERM_R)
+                  \w (paint "w" PERM_W)
+                  \x (paint "x" PERM_X)
+                  (paint (str ch) PERM_DASH)))
+              triad)))
+
+(defn symlink-target
+  "Returns the raw target path a symlink points to, or nil if not a symlink."
+  [^File f]
+  (try
+    (let [path (.toPath f)]
+      (when (Files/isSymbolicLink path)
+        (str (Files/readSymbolicLink path))))
+    (catch Exception _ nil)))
+
+;; ---------------------------------------------------------------------
+;; Git status
+;; ---------------------------------------------------------------------
+
+(defn git-root [dir]
+  (try
+    (let [r (shell {:dir (str dir) :out :string :err :string :continue true}
+                    "git" "rev-parse" "--show-toplevel")]
+      (when (zero? (:exit r)) (str/trim (:out r))))
+    (catch Exception _ nil)))
+
+(defn read-git-status [root]
+  (let [r (shell {:dir root :out :string :err :string :continue true}
+                  "git" "status" "--porcelain=1")]
+    (if-not (zero? (:exit r))
+      {}
+      (reduce
+       (fn [m line]
+         (if (or (str/blank? line) (str/starts-with? line "!!") (< (count line) 3))
+           m
+           (let [code (subs line 0 2)
+                 raw-path (str/trim (subs line 3))
+                 path (if (str/includes? raw-path " -> ")
+                        (second (str/split raw-path #" -> " 2))
+                        raw-path)
+                 untracked? (= code "??")
+                 dirty? (not (str/blank? (str/trim code)))]
+             (assoc m path {:added nil :deleted nil :dirty dirty? :untracked untracked?}))))
+       {}
+       (str/split-lines (:out r))))))
+
+(defn merge-numstat [status-map root]
+  (let [r (shell {:dir root :out :string :err :string :continue true}
+                  "git" "diff" "--numstat" "HEAD")]
+    (if-not (zero? (:exit r))
+      status-map
+      (reduce
+       (fn [m line]
+         (let [parts (str/split line #"\t")]
+           (if (< (count parts) 3)
+             m
+             (let [added (try (Long/parseLong (nth parts 0)) (catch Exception _ nil))
+                   deleted (try (Long/parseLong (nth parts 1)) (catch Exception _ nil))
+                   path (nth parts 2)]
+               (if (and (nil? added) (nil? deleted))
+                 m
+                 (update m path
+                         (fn [existing]
+                           (if existing
+                             (-> existing
+                                 (update :added #(or added %))
+                                 (update :deleted #(or deleted %))
+                                 (assoc :dirty true))
+                             {:added added :deleted deleted :dirty true :untracked false}))))))))
+       status-map
+       (str/split-lines (:out r))))))
+
+(defn sum-opts [a b]
+  (cond (and a b) (+ a b) a a b b :else nil))
+
+(defn scope-git-entries [status-map root list-path]
+  (let [root-path (fs/canonicalize root)
+        list-path (fs/canonicalize list-path)
+        rel-base (let [r (str (fs/relativize root-path list-path))]
+                   (if (= r ".") "" r))
+        base-parts (when-not (str/blank? rel-base) (str/split rel-base #"/"))]
+    (reduce
+     (fn [scoped [path-str status]]
+       (let [parts (str/split path-str #"/")
+             rel-parts (if (nil? base-parts)
+                         parts
+                         (if (and (>= (count parts) (count base-parts))
+                                  (= (take (count base-parts) parts) base-parts))
+                           (drop (count base-parts) parts)
+                           nil))]
+         (if (or (nil? rel-parts) (empty? rel-parts))
+           scoped
+           (let [k (first rel-parts)
+                 existing (get scoped k {:added nil :deleted nil :dirty false :untracked false})]
+             (assoc scoped k
+                    {:added (sum-opts (:added existing) (:added status))
+                     :deleted (sum-opts (:deleted existing) (:deleted status))
+                     :dirty (or (:dirty existing) (:dirty status))
+                     :untracked (or (:untracked existing) (:untracked status))})))))
+     {}
+     status-map)))
+
+(defn load-git-info [list-path]
+  (when-let [root (git-root list-path)]
+    (-> (read-git-status root)
+        (merge-numstat root)
+        (scope-git-entries root list-path))))
+
+(defn format-git [status]
+  (if (and (not (:dirty status)) (not (:untracked status)))
+    ["" (paint "(clean)" GIT_CLEAN)]
+    (let [plain (atom []) colored (atom [])]
+      (when (and (:untracked status) (nil? (:added status)))
+        (swap! plain conj "+?") (swap! colored conj (paint "+?" GIT_ADDED)))
+      (when (:added status)
+        (swap! plain conj (str "+" (:added status)))
+        (swap! colored conj (paint (str "+" (:added status)) GIT_ADDED)))
+      (when (:deleted status)
+        (swap! plain conj (str "-" (:deleted status)))
+        (swap! colored conj (paint (str "-" (:deleted status)) GIT_REMOVED)))
+      (when (empty? @plain)
+        (swap! plain conj "dirty") (swap! colored conj (paint "dirty" GIT_DIRTY)))
+      [(str "(" (str/join " " @plain) ")")
+       (str "(" (str/join " " @colored) ")")])))
+
+;; ---------------------------------------------------------------------
+;; Collecting + sorting entries
+;; ---------------------------------------------------------------------
+
+(defn sort-rows [rows sort-modified? reverse?]
+  (let [cmp (if sort-modified?
+              (fn [a b]
+                (let [c (compare (:modified-millis b) (:modified-millis a))] ; newest first
+                  (if (zero? c)
+                    (compare (str/lower-case (:name-with-git-plain a))
+                             (str/lower-case (:name-with-git-plain b)))
+                    c)))
+              (fn [a b]
+                (cond
+                  (and (:is-dir a) (not (:is-dir b))) -1
+                  (and (not (:is-dir a)) (:is-dir b)) 1
+                  :else (compare (str/lower-case (:name-with-git-plain a))
+                                  (str/lower-case (:name-with-git-plain b))))))
+        sorted (sort cmp rows)]
+    (vec (if reverse? (reverse sorted) sorted))))
+
+(defn collect-entries [path include-hidden? sort-modified? reverse? git-info]
+  (let [dir (File. (str path))
+        files (or (.listFiles dir) (make-array File 0))
+        rows (for [^File f files
+                   :let [name (.getName f)
+                         hidden? (str/starts-with? name ".")]
+                   :when (or include-hidden? (not hidden?))]
+               (let [dir? (.isDirectory f)
+                     exec? (.canExecute f)
+                     size (.length f)
+                     modified (.lastModified f)
+                     [modified-plain recency] (format-relative-time modified)
+                     link-target (symlink-target f)
+                     symlink? (some? link-target)
+                     name-colored (color-name name dir? exec? hidden? symlink?)
+                     type-plain (cond symlink? "link" dir? "dir" :else "file")
+                     [user-perm group-perm other-perm] (split-perm-triad (permission-string f))
+                     git-status (get git-info name)
+                     [gp gc] (if git-status (format-git git-status) [nil nil])
+                     has-suffix? (and gp (not (str/blank? gp)))]
+                 {:name-plain name
+                  :name-with-git-plain (if has-suffix? (str name " " gp) name)
+                  :name-with-git-colored (if has-suffix? (str name-colored " " gc) name-colored)
+                  :type-plain type-plain
+                  :type-colored (paint type-plain TYPE)
+                  :user-perm-plain user-perm
+                  :user-perm-colored (color-perm-triad user-perm)
+                  :group-perm-plain group-perm
+                  :group-perm-colored (color-perm-triad group-perm)
+                  :other-perm-plain other-perm
+                  :other-perm-colored (color-perm-triad other-perm)
+                  :link-target link-target
+                  :size-plain (format-size size)
+                  :size-colored (paint (format-size size) SIZE)
+                  :modified-plain modified-plain
+                  :modified-colored (color-modified modified-plain recency)
+                  :modified-millis modified
+                  :is-dir dir?}))]
+    (sort-rows (vec rows) sort-modified? reverse?)))
+
+;; ---------------------------------------------------------------------
+;; Tree mode
+;; ---------------------------------------------------------------------
+
+(defn tree-entry-label [^File f include-hidden?]
+  (let [name (.getName f)
+        hidden? (str/starts-with? name ".")
+        dir? (.isDirectory f)
+        exec? (.canExecute f)
+        link-target (symlink-target f)
+        symlink? (some? link-target)
+        colored (color-name name dir? exec? hidden? symlink?)]
+    (if symlink?
+      (str colored " " (paint "->" SYMLINK_ARROW) " " (paint link-target SYMLINK))
+      colored)))
+
+(defn list-children [^File dir include-hidden?]
+  (let [files (or (.listFiles dir) (make-array File 0))]
+    (->> files
+         (filter (fn [^File f] (or include-hidden? (not (str/starts-with? (.getName f) ".")))))
+         (sort-by (fn [^File f] [(if (.isDirectory f) 0 1) (str/lower-case (.getName f))]))
+         vec)))
+
+(defn print-tree [^File root include-hidden? git-info]
+  (println (color-name (.getName root) true false false false))
+  (letfn [(walk [^File dir prefix]
+            (let [children (list-children dir include-hidden?)
+                  n (count children)]
+              (doseq [[i ^File child] (map-indexed vector children)]
+                (let [last? (= i (dec n))
+                      branch (if last? "└── " "├── ")
+                      child-prefix (str prefix (if last? "    " "│   "))
+                      name (.getName child)
+                      git-status (get git-info name)
+                      [gp gc] (if git-status (format-git git-status) [nil nil])
+                      suffix (if (and gp (not (str/blank? gp))) (str " " gc) "")]
+                  (println (str (paint prefix TREE_LINES) (paint branch TREE_LINES)
+                                 (tree-entry-label child include-hidden?) suffix))
+                  (when (and (.isDirectory child) (not (symlink-target child)))
+                    (walk child child-prefix))))))]
+    (walk root "")))
+
+(defn pad-cell [colored plain width align]
+  (let [pad (max 0 (- width (count plain)))
+        spaces (apply str (repeat pad \space))]
+    (if (= align :left) (str colored spaces) (str spaces colored))))
+
+(defn horizontal-border [widths kind]
+  (let [[start sep end] (case kind
+                           :top ["┌" "┬" "┐"]
+                           :middle ["├" "┼" "┤"]
+                           :bottom ["└" "┴" "┘"])
+        parts (map (fn [w] (apply str (repeat (+ w 2) "─"))) widths)]
+    (paint (str start (str/join sep parts) end) BORDER)))
+
+(defn render-row [columns widths]
+  (str (paint "│" BORDER)
+       (apply str
+              (map (fn [[plain colored align] width]
+                     (str " " (pad-cell colored plain width align) " " (paint "│" BORDER)))
+                   columns widths))))
+
+;; ---------------------------------------------------------------------
+;; Adaptive column layout
+;;
+;; Columns are dropped least-important-first when the table doesn't fit
+;; the terminal width. The symlink "link" column is truncated (with an
+;; ellipsis) before it is dropped outright. "#" and "name" are never
+;; dropped, no matter how narrow the terminal is.
+;; ---------------------------------------------------------------------
+
+(def BASE_COLS [:index :name :type :size :modified])
+(def LONG_EXTRA_COLS [:usr :grp :oth :link])
+(def ESSENTIAL_COLS #{:index :name})
+(def DROPPABLE_ORDER [:link :oth :grp :usr :modified :size :type])
+(def MIN_LINK_WIDTH 6)
+
+(defn col-header [id]
+  (case id
+    :index "#" :name "name" :type "type" :size "size" :modified "modified"
+    :usr "usr" :grp "grp" :oth "oth" :link "link"))
+
+(defn col-align [id]
+  (case id
+    :index :right
+    :size :right
+    :left))
+
+(defn link-natural-len [row]
+  (if-let [target (:link-target row)]
+    (+ 3 (count target)) ; "-> " + target
+    1))                  ; "-"
+
+(defn col-natural-width [id rows]
+  (max (count (col-header id))
+       (if (seq rows)
+         (case id
+           :index (count (str (max 0 (dec (count rows)))))
+           :name (apply max (map #(count (:name-with-git-plain %)) rows))
+           :type (apply max (map #(count (:type-plain %)) rows))
+           :size (apply max (map #(count (:size-plain %)) rows))
+           :modified (apply max (map #(count (:modified-plain %)) rows))
+           (:usr :grp :oth) 3
+           :link (apply max (map link-natural-len rows)))
+         1)))
+
+(defn table-total-width [widths]
+  (if (empty? widths)
+    0
+    (+ 1 (* 3 (count widths)) (apply + widths))))
+
+(defn build-link-cell [target width]
+  (if (nil? target)
+    ["-" (paint "-" PERMS_NONE)]
+    (let [full (str "-> " target)]
+      (if (<= (count full) width)
+        [full (str (paint "->" SYMLINK_ARROW) " " (paint target SYMLINK))]
+        (let [avail (max 0 (- width 3 1))
+              truncated (if (pos? avail) (subs target 0 (min avail (count target))) "")
+              plain (str "-> " truncated "…")]
+          [plain (str (paint "->" SYMLINK_ARROW) " " (paint (str truncated "…") SYMLINK))])))))
+
+(defn cell-for [id row width]
+  (case id
+    :index [(:idx-plain row) (:idx-colored row) (col-align id)]
+    :name [(:name-with-git-plain row) (:name-with-git-colored row) (col-align id)]
+    :type [(:type-plain row) (:type-colored row) (col-align id)]
+    :size [(:size-plain row) (:size-colored row) (col-align id)]
+    :modified [(:modified-plain row) (:modified-colored row) (col-align id)]
+    :usr [(:user-perm-plain row) (:user-perm-colored row) (col-align id)]
+    :grp [(:group-perm-plain row) (:group-perm-colored row) (col-align id)]
+    :oth [(:other-perm-plain row) (:other-perm-colored row) (col-align id)]
+    :link (let [[p c] (build-link-cell (:link-target row) width)]
+            [p c (col-align id)])))
+
+(defn fit-columns
+  "Decides which columns fit in term-width. Shrinks the link column with
+   an ellipsis first; once it's at its minimum, columns are dropped in
+   DROPPABLE_ORDER until the table fits or only #/name remain."
+  [rows term-width long?]
+  (let [full-order (into BASE_COLS (if long? LONG_EXTRA_COLS []))
+        natural (into {} (map (fn [id] [id (col-natural-width id rows)]) full-order))]
+    (loop [active full-order
+           link-width (get natural :link)]
+      (let [widths (mapv (fn [id] (if (= id :link) link-width (get natural id))) active)
+            total (table-total-width widths)]
+        (if (<= total term-width)
+          {:active active :widths widths}
+          (cond
+            (and (some #{:link} active) (> link-width MIN_LINK_WIDTH))
+            (recur active (max MIN_LINK_WIDTH (- link-width (- total term-width))))
+
+            (some #{:link} active)
+            (recur (vec (remove #{:link} active)) link-width)
+
+            :else
+            (let [drop-id (first (filter (set active) DROPPABLE_ORDER))]
+              (if drop-id
+                (recur (vec (remove #{drop-id} active)) link-width)
+                {:active active :widths widths}))))))))
+
+(defn render-table [rows long?]
+  (let [term-width (terminal-width)
+        rows (mapv (fn [i row] (assoc row :idx-plain (str i) :idx-colored (paint (str i) INDEX)))
+                    (range) rows)
+        {:keys [active widths]} (fit-columns rows term-width long?)
+        header-cells (mapv (fn [id] [(col-header id) (paint (col-header id) HEADER) (col-align id)]) active)]
+    (println (horizontal-border widths :top))
+    (println (render-row header-cells widths))
+    (println (horizontal-border widths :middle))
+    (doseq [row rows]
+      (let [cells (mapv (fn [id w] (cell-for id row w)) active widths)]
+        (println (render-row cells widths))))
+    (println (horizontal-border widths :bottom))))
+
+;; ---------------------------------------------------------------------
+;; Main
+;; ---------------------------------------------------------------------
+
+(defn -main [args]
+  (let [opts (parse-args args)
+        path (:path opts)]
+    (if-not (fs/exists? path)
+      (do (println (str (paint "error:" WARN) " cannot read " path))
+          (System/exit 1))
+      (let [git-info (when (:git opts) (load-git-info path))]
+        (if (:tree opts)
+          (print-tree (File. (str path)) (:include-hidden opts) git-info)
+          (let [rows (collect-entries path (:include-hidden opts) (:sort-modified opts)
+                                       (:reverse opts) git-info)]
+            (render-table rows (:long opts))))))))
+
+(-main *command-line-args*)
+
