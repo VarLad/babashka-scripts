@@ -14,7 +14,7 @@ This repository contains babashka scripts.
 
 ![babls in action](babls/babls1.png)
 
-## [babls](babls/babls)
+## [babash_prompt](babash_prompt/babash_prompt)
 
 Modern bash prompt, written and configurable in Babashka, heavily inspired by [pkazmier's bash prompt](https://github.com/pkazmier/bash-prompt)
 ![babash_prompt in action](babash_prompt/babash_prompt1.png)
