@@ -1,0 +1,117 @@
+function __ps1_timer_start {
+  printf "\033[0m"
+  __ps1_timer=${__ps1_timer:-$SECONDS}
+}
+function __ps1_timer_stop {
+  __ps1_exit=$?
+  __ps1_timer_show=$(( SECONDS - ${__ps1_timer:-SECONDS} ))
+  unset __ps1_timer
+}
+if [[ ! $(trap -p DEBUG) = *__ps1_timer_start* ]]; then trap '__ps1_timer_start' DEBUG; fi
+if [[ ! $PROMPT_COMMAND = *__ps1_timer_stop* ]]; then PROMPT_COMMAND="$PROMPT_COMMAND; __ps1_timer_stop"; fi
+
+# Read the code cleanly into a Bash string variable in RAM at shell startup.
+read -r -d '' __ps1_clj_code <<'CLJEOF'
+(require '[clojure.string :as str]
+         '[babashka.process :as p])
+
+(def pal 
+  {:normal "\u001b[0m"    :black "\u001b[38;5;0m" :red "\u001b[38;5;1m" 
+   :green  "\u001b[38;5;2m" :yellow "\u001b[38;5;3m" :blue "\u001b[38;5;4m" 
+   :magenta "\u001b[38;5;5m" :cyan "\u001b[38;5;6m" :white "\u001b[38;5;7m" 
+   :bblack "\u001b[38;5;8m" :bwhite "\u001b[38;5;15m"})
+
+(def themes
+  {"colorful" {:t :bblack :time :bwhite :d0 :green :dx :red :ur :red :u :magenta :h :yellow :dir :cyan :git :magenta :j :red :in :blue}
+   "dark"     {:t :bblack :time :bblack :d0 :bblack :dx :red :ur :red :u :bblack :h :bblack :dir :bblack :git :bblack :j :bblack :in :blue}
+   "white"    {:t :bblack :time :bwhite :d0 :bwhite :dx :red :ur :red :u :bwhite :h :bwhite :dir :bwhite :git :bwhite :j :bwhite :in :blue}
+   "blue"     {:t :blue :time :blue :d0 :blue :dx :yellow :ur :yellow :u :blue :h :blue :dir :blue :git :blue :j :blue :in :red}
+   "green"    {:t :green :time :green :d0 :green :dx :red :ur :red :u :green :h :green :dir :green :git :green :j :green :in :yellow}
+   "yellow"   {:t :yellow :time :yellow :d0 :yellow :dx :red :ur :red :u :yellow :h :yellow :dir :yellow :j :yellow :in :blue}
+   "red"      {:t :red :time :red :d0 :red :dx :yellow :ur :yellow :u :red :h :red :dir :red :git :red :j :red :in :blue}})
+
+(defn c [theme k] 
+  (str "\u0001\u001b[0m" (pal (get theme k k)) "\u0002"))
+
+(defn dirtrim []
+  (let [h (System/getenv "HOME")
+        p (or (System/getenv "PWD") "")
+        t (if (and h (seq h) (str/starts-with? p h)) (str "~" (subs p (count h))) p)
+        s (vec (remove str/blank? (str/split t #"/")))]
+    (if (> (count s) 3) (str ".../" (str/join "/" (take-last 3 s))) t)))
+
+(defn find-git-dir [^java.io.File dir]
+  (when (and dir (.exists dir))
+    (let [git-file (clojure.java.io/file dir ".git")]
+      (cond
+        (.isDirectory git-file) git-file
+        (.isFile git-file)
+        (try
+          (let [line (str/trim (slurp git-file))]
+            (when (str/starts-with? line "gitdir:")
+              (clojure.java.io/file dir (str/trim (subs line 7)))))
+          (catch Exception _ nil))
+        :else
+        (let [parent (.getParentFile dir)]
+          (when (and parent (not= (.getPath dir) (.getPath parent)))
+            (recur parent)))))))
+
+(defn git-info []
+  (try
+    (let [pwd (or (System/getenv "PWD") (System/getProperty "user.dir"))]
+      (when-let [git-dir (find-git-dir (clojure.java.io/file pwd))]
+        (let [head-file (clojure.java.io/file git-dir "HEAD")]
+          (when (.exists head-file)
+            (let [head (str/trim (slurp head-file))
+                  branch (if (str/starts-with? head "ref: refs/heads/")
+                           (subs head 16)
+                           (subs head 0 7))
+                  status-res (p/sh {:dir pwd} "git" "status" "--porcelain")
+                  lines (when (zero? (:exit status-res))
+                          (remove str/blank? (str/split-lines (:out status-res))))]
+              (if (seq lines)
+                (let [staged?   (some #(re-matches #"^[MADRC].*" %) lines)
+                      unstaged? (some #(re-matches #"^.[MD?].*" %) lines)
+                      suffix    (str (when staged? "+") (when unstaged? "*"))]
+                  (str branch " " suffix))
+                branch))))))
+    (catch Exception _ nil)))
+
+(let [[exit-code dur jobs uid] *command-line-args*
+      theme (get themes (or (System/getenv "BASH_PROMPT_THEME") "colorful") (themes "colorful"))
+      col   #(c theme %)
+      wrap  #(if (seq %3) (str (col :t) %1 %4 (col :t) %2) "")
+      
+      host-fut (future
+                 (first (str/split (or (not-empty (System/getenv "HOSTNAME"))
+                                       (try (str/trim (:out (p/sh "hostname"))) (catch Exception _ "localhost"))) 
+                                   #"\.")))
+      
+      user  (System/getProperty "user.name")
+      time  (.format (java.time.LocalTime/now) (java.time.format.DateTimeFormatter/ofPattern "HH:mm"))
+      root? (= uid "0")
+      git   (git-info)
+      
+      j-num (count (remove str/blank? (str/split (or jobs "") #"\s+")))
+      j-str (when (pos? j-num) (str j-num))
+      host  @host-fut]
+  
+  (print (str "\n" (col :t) "\u250c "
+              (col :time) time " "
+              (wrap "[" "] " dur (str (col (if (= exit-code "0") :d0 :dx)) dur "s"))
+              (col :t) "<" (col (if root? :ur :u)) user
+              (col :t) "@" (col :h) host
+              (col :t) "> "
+              (wrap "[" "] " "x" (str (col :dir) (dirtrim)))
+              (wrap "(" ") " git (str (col :git) git))
+              (wrap "<" "> " j-str (str (col :j) j-str))
+              "\n" (col :t) "\u2514\u2500 " (col :in)))
+  (flush))
+CLJEOF
+
+function __ps1_render {
+  # Execute directly out of the Bash variable string via Babashka's inline evaluation flag
+  bb -e "$__ps1_clj_code" "$1" "$2" "$3" "$4"
+}
+
+PS1='$(__ps1_render "$__ps1_exit" "$__ps1_timer_show" "$(jobs -p)" "$UID")'
